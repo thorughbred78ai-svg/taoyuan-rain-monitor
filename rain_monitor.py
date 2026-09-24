@@ -2,16 +2,41 @@
 
 import json
 import os
-import sys
 from datetime import datetime
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
 
-CWA_API_URL = "https://opendata.cwa.gov.tw/api/v1/rest/datastore/C-B0025-001"
+# ============================================================
+# CWA API
+# ============================================================
 
-# 預設監測測站
+# 雨量觀測站－雨量資料
+#
+# 更新頻率：10 分鐘
+# 包含：
+# - 本日 0 時至目前累積雨量
+# - 10 分鐘累積雨量
+# - 1 小時累積雨量
+# - 3 小時累積雨量
+# - 6 小時累積雨量
+# - 12 小時累積雨量
+# - 24 小時累積雨量
+#
+# CWA 官方資料集：
+# O-A0002-001
+#
+CWA_API_URL = (
+    "https://opendata.cwa.gov.tw/api/v1/rest/datastore/"
+    "O-A0002-001"
+)
+
+
+# ============================================================
+# 桃園監測測站
+# ============================================================
+
 TARGET_STATIONS = [
     "大溪永福",
     "中大臨海站",
@@ -45,7 +70,11 @@ TARGET_STATIONS = [
     "中壢",
 ]
 
-# GitHub Actions 自動回報的五站
+
+# ============================================================
+# GitHub Actions 自動回報測站
+# ============================================================
+
 DEFAULT_REPORT_STATIONS = [
     "新屋",
     "八德",
@@ -55,247 +84,602 @@ DEFAULT_REPORT_STATIONS = [
 ]
 
 
+# ============================================================
+# Environment
+# ============================================================
+
 def get_env(name: str, required: bool = True) -> str:
     value = os.getenv(name, "").strip()
 
     if required and not value:
-        raise RuntimeError(f"缺少環境變數：{name}")
+        raise RuntimeError(
+            f"缺少環境變數：{name}"
+        )
 
     return value
 
 
-def get_today() -> str:
-    """
-    GitHub Runner 使用 UTC，但雨量資料以台灣日期為主。
-    使用 ZoneInfo 取得 Asia/Taipei 今日日期。
-    """
+# ============================================================
+# 台灣日期時間
+# ============================================================
+
+def get_taipei_now():
     try:
         from zoneinfo import ZoneInfo
 
-        return datetime.now(ZoneInfo("Asia/Taipei")).strftime("%Y-%m-%d")
+        return datetime.now(
+            ZoneInfo("Asia/Taipei")
+        )
+
     except Exception:
-        return datetime.now().strftime("%Y-%m-%d")
+        return datetime.now()
 
 
-def fetch_cwa_data(api_key: str, date_str: str) -> dict:
+def get_today() -> str:
+    return get_taipei_now().strftime(
+        "%Y-%m-%d"
+    )
+
+
+# ============================================================
+# CWA API
+# ============================================================
+
+def fetch_cwa_data(api_key: str) -> dict:
+
     params = {
         "format": "JSON",
-        "DataType": "stationObsTimes",
-        "timeFrom": date_str,
+        "Authorization": api_key,
     }
 
-    url = f"{CWA_API_URL}?{urlencode(params)}"
+    url = (
+        f"{CWA_API_URL}?"
+        f"{urlencode(params)}"
+    )
 
     request = Request(
         url,
         headers={
             "Authorization": api_key,
             "Accept": "application/json",
-            "User-Agent": "taoyuan-rain-monitor/github-actions",
+            "User-Agent": (
+                "taoyuan-rain-monitor/"
+                "github-actions"
+            ),
         },
         method="GET",
     )
 
+    print("CWA API:")
+    print(CWA_API_URL)
+
     try:
-        with urlopen(request, timeout=30) as response:
-            body = response.read().decode("utf-8")
+
+        with urlopen(
+            request,
+            timeout=30
+        ) as response:
+
+            body = response.read().decode(
+                "utf-8"
+            )
+
             return json.loads(body)
 
     except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
+
+        body = exc.read().decode(
+            "utf-8",
+            errors="replace"
+        )
+
         raise RuntimeError(
-            f"CWA API HTTP {exc.code}: {body[:1000]}"
+            f"CWA API HTTP {exc.code}: "
+            f"{body[:1000]}"
         ) from exc
 
     except URLError as exc:
+
         raise RuntimeError(
-            f"CWA API 連線失敗：{exc.reason}"
+            f"CWA API 連線失敗："
+            f"{exc.reason}"
         ) from exc
 
 
+# ============================================================
+# 雨量資料解析
+# ============================================================
+
 def parse_precipitation(raw):
-    """
-    CWA 的 T 視為微量雨。
-    原 n8n 流程將 T 轉成 0 mm，這裡保持相同邏輯。
-    """
+
     if raw is None:
         return 0.0
 
-    raw_str = str(raw).strip()
+    value = str(raw).strip()
 
-    if raw_str in ("", "T"):
+    # T = 雨跡
+    if value == "T":
+        return 0.0
+
+    # 空值
+    if value == "":
+        return 0.0
+
+    # X = 儀器故障
+    if value.upper() == "X":
         return 0.0
 
     try:
-        value = float(raw_str)
 
-        if value != value:  # NaN
+        number = float(value)
+
+        if number != number:
             return 0.0
 
-        return value
+        return number
 
-    except (TypeError, ValueError):
+    except (
+        TypeError,
+        ValueError
+    ):
+
         return 0.0
 
 
+# ============================================================
+# Normalize CWA O-A0002-001
+# ============================================================
+
 def normalize_data(payload: dict) -> list[dict]:
-    records = payload.get("records", {})
 
-    locations = records.get("location", [])
+    records = payload.get(
+        "records",
+        {}
+    )
 
-    if not isinstance(locations, list):
+    # --------------------------------------------------------
+    # O-A0002-001 常見結構
+    #
+    # records.locations.station
+    #
+    # 同時支援 locations / location
+    # --------------------------------------------------------
+
+    locations = (
+        records.get("locations")
+        or records.get("location")
+        or []
+    )
+
+    if isinstance(locations, dict):
         locations = [locations]
 
     output = []
 
     for location in locations:
-        station = location.get("station", {}) or {}
 
-        station_name = station.get("StationName", "")
-
-        if station_name not in TARGET_STATIONS:
-            continue
-
-        observations = (
-            location
-            .get("stationObsTimes", {})
-            .get("stationObsTime", [])
+        station = (
+            location.get(
+                "station",
+                {}
+            )
+            or {}
         )
 
-        if not isinstance(observations, list):
-            observations = [observations]
+        station_name = (
+            station.get(
+                "StationName"
+            )
+            or location.get(
+                "StationName"
+            )
+            or ""
+        )
+
+        if (
+            station_name
+            not in TARGET_STATIONS
+        ):
+            continue
+
+        station_id = (
+            station.get(
+                "StationId"
+            )
+            or station.get(
+                "StationID"
+            )
+            or location.get(
+                "StationId"
+            )
+            or ""
+        )
+
+        station_name_en = (
+            station.get(
+                "StationNameEN"
+            )
+            or ""
+        )
+
+        station_attribute = (
+            station.get(
+                "StationAttribute"
+            )
+            or ""
+        )
+
+        # ----------------------------------------------------
+        # O-A0002-001
+        #
+        # 可能直接把資料放在：
+        #
+        # location.StationObsTimes
+        #
+        # 或：
+        #
+        # location.stationObsTimes
+        # ----------------------------------------------------
+
+        observations = (
+            location.get(
+                "stationObsTimes"
+            )
+            or location.get(
+                "StationObsTimes"
+            )
+            or []
+        )
+
+        if isinstance(
+            observations,
+            dict
+        ):
+
+            observations = (
+                observations.get(
+                    "stationObsTime"
+                )
+                or observations.get(
+                    "StationObsTime"
+                )
+                or []
+            )
+
+        if isinstance(
+            observations,
+            dict
+        ):
+            observations = [
+                observations
+            ]
+
+        # ----------------------------------------------------
+        # 如果 API 直接將測站資料放在 location
+        # ----------------------------------------------------
+
+        if not observations:
+
+            date_time = (
+                location.get(
+                    "DateTime"
+                )
+                or location.get(
+                    "Date"
+                )
+                or ""
+            )
+
+            raw_precipitation = (
+                location.get(
+                    "Precipitation"
+                )
+            )
+
+            if (
+                date_time
+                or raw_precipitation
+                is not None
+            ):
+
+                precipitation = (
+                    parse_precipitation(
+                        raw_precipitation
+                    )
+                )
+
+                output.append(
+                    {
+                        "StationID": station_id,
+                        "StationName": station_name,
+                        "StationNameEN": station_name_en,
+                        "StationAttribute": station_attribute,
+                        "DateTime": date_time,
+                        "Date": (
+                            str(date_time)[:10]
+                            if date_time
+                            else ""
+                        ),
+                        "Precipitation": precipitation,
+                        "PrecipitationRaw": (
+                            ""
+                            if raw_precipitation
+                            is None
+                            else str(
+                                raw_precipitation
+                            )
+                        ),
+                        "Rain": precipitation > 0,
+                        "DataSource": "CWA O-A0002-001",
+                    }
+                )
+
+            continue
+
+        # ----------------------------------------------------
+        # 解析 stationObsTime
+        # ----------------------------------------------------
 
         for obs in observations:
-            weather_elements = obs.get("weatherElements", {}) or {}
 
-            raw = weather_elements.get("Precipitation")
+            weather_elements = (
+                obs.get(
+                    "weatherElements",
+                    {}
+                )
+                or {}
+            )
 
-            precipitation = parse_precipitation(raw)
+            raw_precipitation = (
+                weather_elements.get(
+                    "Precipitation"
+                )
+            )
 
-            date_value = obs.get("Date", "")
+            # 某些資料格式可能直接放在 obs
+            if (
+                raw_precipitation
+                is None
+            ):
+                raw_precipitation = (
+                    obs.get(
+                        "Precipitation"
+                    )
+                )
+
+            date_time = (
+                obs.get(
+                    "DateTime"
+                )
+                or obs.get(
+                    "Date"
+                )
+                or ""
+            )
+
+            precipitation = (
+                parse_precipitation(
+                    raw_precipitation
+                )
+            )
 
             output.append(
                 {
-                    "StationID": station.get("StationID", ""),
+                    "StationID": station_id,
                     "StationName": station_name,
-                    "StationNameEN": station.get(
-                        "StationNameEN", ""
-                    ),
-                    "StationAttribute": station.get(
-                        "StationAttribute", ""
-                    ),
-                    "Date": date_value,
-                    "Precipitation": precipitation,
-                    "PrecipitationRaw": (
-                        "" if raw is None else str(raw)
-                    ),
-                    "Rain": precipitation > 0,
-                    "YearMonth": (
-                        str(date_value)[:7]
-                        if date_value
+                    "StationNameEN": station_name_en,
+                    "StationAttribute": station_attribute,
+                    "DateTime": date_time,
+                    "Date": (
+                        str(date_time)[:10]
+                        if date_time
                         else ""
                     ),
-                    "DataSource": "CWA C-B0025-001",
+                    "Precipitation": precipitation,
+                    "PrecipitationRaw": (
+                        ""
+                        if raw_precipitation
+                        is None
+                        else str(
+                            raw_precipitation
+                        )
+                    ),
+                    "Rain": precipitation > 0,
+                    "DataSource": "CWA O-A0002-001",
                 }
             )
 
     return output
 
 
-def latest_station_rows(rows: list[dict]) -> dict[str, dict]:
-    """
-    同一測站若 API 回傳多筆資料，只保留日期最新的一筆。
-    """
+# ============================================================
+# 取每個測站最新資料
+# ============================================================
+
+def latest_station_rows(
+    rows: list[dict]
+) -> dict[str, dict]:
+
     result = {}
 
     for row in rows:
-        name = row["StationName"]
 
-        if name not in result:
-            result[name] = row
+        name = row.get(
+            "StationName"
+        )
+
+        if not name:
             continue
 
-        old_date = str(result[name].get("Date", ""))
-        new_date = str(row.get("Date", ""))
+        if name not in result:
 
-        if new_date >= old_date:
+            result[name] = row
+
+            continue
+
+        old_time = str(
+            result[name].get(
+                "DateTime",
+                ""
+            )
+        )
+
+        new_time = str(
+            row.get(
+                "DateTime",
+                ""
+            )
+        )
+
+        if new_time >= old_time:
+
             result[name] = row
 
     return result
 
+
+# ============================================================
+# 建立 Telegram 每日報告
+# ============================================================
 
 def build_report(
     station_map: dict[str, dict],
     requested_stations: list[str],
     date_str: str,
 ) -> str:
+
     lines = [
         "🌧️ 桃園每日雨量監測",
         "━━━━━━━━━━━━━━━━",
         f"📅 資料日期：{date_str}",
-        f"📍 查詢測站：{'、'.join(requested_stations)}",
+        (
+            "🕐 更新時間："
+            f"{get_taipei_now().strftime('%Y-%m-%d %H:%M:%S')}"
+        ),
+        (
+            "📍 查詢測站："
+            f"{'、'.join(requested_stations)}"
+        ),
         "",
     ]
 
     found_count = 0
+
     not_found = []
 
     for station_name in requested_stations:
-        data = station_map.get(station_name)
+
+        data = station_map.get(
+            station_name
+        )
 
         if not data:
-            not_found.append(station_name)
+
+            not_found.append(
+                station_name
+            )
+
             continue
 
         found_count += 1
 
-        rain = data["Precipitation"]
+        rain = float(
+            data.get(
+                "Precipitation",
+                0
+            )
+        )
 
-        rain_icon = "🌧️" if rain > 0 else "☀️"
+        rain_icon = (
+            "🌧️"
+            if rain > 0
+            else "☀️"
+        )
 
         lines.extend(
             [
                 f"📍 {station_name}",
-                f"   測站編號：{data.get('StationID') or '無資料'}",
-                f"   日期：{data.get('Date') or '無資料'}",
-                f"   {rain_icon} 今日累積雨量：{rain:g} mm",
-                f"   測站類型：{data.get('StationAttribute') or '無資料'}",
+                (
+                    "   測站編號："
+                    f"{data.get('StationID') or '無資料'}"
+                ),
+                (
+                    "   觀測時間："
+                    f"{data.get('DateTime') or '無資料'}"
+                ),
+                (
+                    f"   {rain_icon} "
+                    "今日累積雨量："
+                    f"{rain:g} mm"
+                ),
+                (
+                    "   測站類型："
+                    f"{data.get('StationAttribute') or '雨量觀測站'}"
+                ),
                 "────────────────",
             ]
         )
 
     if not_found:
+
         lines.extend(
             [
-                f"⚠️ 無資料：{'、'.join(not_found)}",
+                (
+                    "⚠️ 無資料："
+                    f"{'、'.join(not_found)}"
+                ),
                 "",
             ]
         )
 
     lines.extend(
         [
-            f"📊 已取得 {found_count} 筆測站資料",
-            "🔎 資料來源：中央氣象署 C-B0025-001",
+            (
+                f"📊 已取得 {found_count} "
+                "筆測站資料"
+            ),
+            (
+                "🔎 資料來源："
+                "中央氣象署 O-A0002-001"
+            ),
         ]
     )
 
     return "\n".join(lines)
 
 
+# ============================================================
+# 高雨量警報
+# ============================================================
+
 def find_alerts(
     station_map: dict[str, dict],
     threshold: float,
 ) -> list[dict]:
+
     triggered = []
 
     for station_name in TARGET_STATIONS:
-        data = station_map.get(station_name)
+
+        data = station_map.get(
+            station_name
+        )
 
         if not data:
             continue
 
-        if data["Precipitation"] >= threshold:
-            triggered.append(data)
+        precipitation = float(
+            data.get(
+                "Precipitation",
+                0
+            )
+        )
+
+        if precipitation >= threshold:
+
+            triggered.append(
+                data
+            )
 
     return triggered
 
@@ -304,21 +688,32 @@ def build_alert(
     triggered: list[dict],
     threshold: float,
 ) -> str:
+
     lines = [
         "🚨 桃園今日雨量警報",
         "━━━━━━━━━━━━━━━━",
-        f"⚠️ 今日累積雨量達 {threshold:g} mm 以上",
+        (
+            f"⚠️ 今日累積雨量達 "
+            f"{threshold:g} mm 以上"
+        ),
         "",
     ]
 
     for station in triggered:
+
         lines.extend(
             [
-                f"📍 測站：{station['StationName']}",
-                f"📅 日期：{station.get('Date') or '無資料'}",
+                (
+                    "📍 測站："
+                    f"{station['StationName']}"
+                ),
+                (
+                    "🕐 觀測時間："
+                    f"{station.get('DateTime') or '無資料'}"
+                ),
                 (
                     "🌧️ 今日累積雨量："
-                    f"{station['Precipitation']:g} mm"
+                    f"{float(station['Precipitation']):g} mm"
                 ),
                 (
                     "🆔 測站編號："
@@ -328,19 +723,27 @@ def build_alert(
             ]
         )
 
-    lines.append("🔎 資料來源：中央氣象署 C-B0025-001")
+    lines.append(
+        "🔎 資料來源："
+        "中央氣象署 O-A0002-001"
+    )
 
     return "\n".join(lines)
 
+
+# ============================================================
+# Telegram
+# ============================================================
 
 def send_telegram(
     bot_token: str,
     chat_id: str,
     text: str,
 ) -> None:
+
     url = (
-        f"https://api.telegram.org/bot"
-        f"{bot_token}/sendMessage"
+        "https://api.telegram.org/"
+        f"bot{bot_token}/sendMessage"
     )
 
     payload = urlencode(
@@ -354,74 +757,167 @@ def send_telegram(
         url,
         data=payload,
         headers={
-            "Content-Type": (
-                "application/x-www-form-urlencoded"
-            ),
-            "User-Agent": "taoyuan-rain-monitor/github-actions",
+            "Content-Type":
+                "application/x-www-form-urlencoded",
+            "User-Agent":
+                "taoyuan-rain-monitor/"
+                "github-actions",
         },
         method="POST",
     )
 
     try:
-        with urlopen(request, timeout=30) as response:
-            body = response.read().decode("utf-8")
-            result = json.loads(body)
+
+        with urlopen(
+            request,
+            timeout=30
+        ) as response:
+
+            body = response.read().decode(
+                "utf-8"
+            )
+
+            result = json.loads(
+                body
+            )
 
             if not result.get("ok"):
+
                 raise RuntimeError(
-                    f"Telegram API 回傳失敗：{result}"
+                    "Telegram API 回傳失敗："
+                    f"{result}"
                 )
 
     except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
+
+        body = exc.read().decode(
+            "utf-8",
+            errors="replace"
+        )
 
         raise RuntimeError(
-            f"Telegram HTTP {exc.code}: {body[:1000]}"
+            f"Telegram HTTP {exc.code}: "
+            f"{body[:1000]}"
         ) from exc
 
     except URLError as exc:
+
         raise RuntimeError(
-            f"Telegram 連線失敗：{exc.reason}"
+            f"Telegram 連線失敗："
+            f"{exc.reason}"
         ) from exc
 
 
-def main() -> int:
-    api_key = get_env("CWA_API_KEY")
-    bot_token = get_env("TELEGRAM_BOT_TOKEN")
-    chat_id = get_env("TELEGRAM_CHAT_ID")
+# ============================================================
+# Main
+# ============================================================
 
-    # 原 n8n Rain Alert Engine 實際使用 100。
-    # 可在 GitHub Actions Variables 改成 350。
-    threshold = float(
-        os.getenv("RAIN_THRESHOLD_MM", "100")
+def main() -> int:
+
+    api_key = get_env(
+        "CWA_API_KEY"
     )
 
-    date_str = get_today()
+    bot_token = get_env(
+        "TELEGRAM_BOT_TOKEN"
+    )
 
-    print(f"查詢日期：{date_str}")
-    print(f"雨量警戒門檻：{threshold:g} mm")
+    chat_id = get_env(
+        "TELEGRAM_CHAT_ID"
+    )
+
+    threshold = float(
+        os.getenv(
+            "RAIN_THRESHOLD_MM",
+            "100"
+        )
+    )
+
+    today = get_today()
+
+    print(
+        f"查詢日期：{today}"
+    )
+
+    print(
+        "資料來源：CWA O-A0002-001"
+    )
+
+    print(
+        f"雨量警戒門檻："
+        f"{threshold:g} mm"
+    )
+
+    # --------------------------------------------------------
+    # CWA
+    # --------------------------------------------------------
 
     payload = fetch_cwa_data(
-        api_key=api_key,
-        date_str=date_str,
+        api_key
     )
 
-    rows = normalize_data(payload)
+    # --------------------------------------------------------
+    # Normalize
+    # --------------------------------------------------------
+
+    rows = normalize_data(
+        payload
+    )
+
+    print(
+        f"CWA 回傳桃園目標資料筆數："
+        f"{len(rows)}"
+    )
 
     if not rows:
-        raise RuntimeError(
-            "CWA API 未取得桃園指定測站今日資料"
+
+        # ----------------------------------------------------
+        # 額外輸出 API 結構，方便 GitHub Actions debug
+        # ----------------------------------------------------
+
+        print(
+            "⚠️ CWA API 有回應，但沒有解析到目標測站。"
         )
 
-    station_map = latest_station_rows(rows)
+        print(
+            "records keys：",
+            list(
+                payload.get(
+                    "records",
+                    {}
+                ).keys()
+            )
+        )
 
-    # --------------------------------------------
-    # 自動回報五站
-    # --------------------------------------------
+        raise RuntimeError(
+            "CWA API 未取得桃園指定測站資料"
+        )
+
+    # --------------------------------------------------------
+    # 最新測站資料
+    # --------------------------------------------------------
+
+    station_map = latest_station_rows(
+        rows
+    )
+
+    print(
+        "成功辨識測站："
+        + "、".join(
+            station_map.keys()
+        )
+    )
+
+    # --------------------------------------------------------
+    # 每日報告
+    # --------------------------------------------------------
+
     report = build_report(
         station_map=station_map,
-        requested_stations=DEFAULT_REPORT_STATIONS,
-        date_str=date_str,
+        requested_stations=(
+            DEFAULT_REPORT_STATIONS
+        ),
+        date_str=today,
     )
 
     print("")
@@ -433,15 +929,17 @@ def main() -> int:
         text=report,
     )
 
-    # --------------------------------------------
+    # --------------------------------------------------------
     # 高雨量警報
-    # --------------------------------------------
+    # --------------------------------------------------------
+
     triggered = find_alerts(
         station_map=station_map,
         threshold=threshold,
     )
 
     if triggered:
+
         alert = build_alert(
             triggered=triggered,
             threshold=threshold,
@@ -457,16 +955,27 @@ def main() -> int:
         )
 
     else:
+
         print(
-            f"\n沒有測站達到 {threshold:g} mm 警戒門檻。"
+            f"沒有測站達到 "
+            f"{threshold:g} mm 警戒門檻。"
         )
 
     return 0
 
 
 if __name__ == "__main__":
+
     try:
-        raise SystemExit(main())
+
+        raise SystemExit(
+            main()
+        )
+
     except Exception as exc:
-        print(f"❌ Workflow 執行失敗：{exc}", file=sys.stderr)
+
+        print(
+            f"❌ Workflow 執行失敗：{exc}"
+        )
+
         raise
