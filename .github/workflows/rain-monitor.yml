@@ -1,0 +1,69 @@
+name: 桃園每日雨量監測
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    # GitHub Actions 支援 timezone
+    # 桃園使用 Asia/Taipei
+    - cron: "0 8,10,12,14,16,18,20,22 * * *"
+      timezone: "Asia/Taipei"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: taoyuan-rain-monitor
+  cancel-in-progress: false
+
+jobs:
+  rain-monitor:
+    name: CWA 雨量監測
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 5
+
+    env:
+      CWA_API_KEY: ${{ secrets.CWA_API_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      # 原 n8n Rain Alert Engine 實際程式為 100 mm。
+      # 如果你要使用 Sticky Note 所寫的 350 mm，
+      # 改成 350。
+      RAIN_THRESHOLD_MM: "100"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${CWA_API_KEY}" ]]; then
+            echo "❌ CWA_API_KEY 未設定"
+            exit 1
+          fi
+
+          if [[ -z "${TELEGRAM_BOT_TOKEN}" ]]; then
+            echo "❌ TELEGRAM_BOT_TOKEN 未設定"
+            exit 1
+          fi
+
+          if [[ -z "${TELEGRAM_CHAT_ID}" ]]; then
+            echo "❌ TELEGRAM_CHAT_ID 未設定"
+            exit 1
+          fi
+
+          echo "✅ GitHub Secrets 設定完成"
+
+      - name: Run Taoyuan Rain Monitor
+        run: |
+          python rain_monitor.py
