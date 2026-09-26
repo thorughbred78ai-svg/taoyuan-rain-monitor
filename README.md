@@ -3,115 +3,275 @@ taoyuan-rain-monitor
 
 🌧️ 桃園每日雨量監測系統
 
-使用 GitHub Actions + Python + 中央氣象署 CWA API + Telegram Bot 建立桃園地區每日雨量自動監測與高雨量警報系統。
+使用中央氣象署（CWA）開放資料 API O-A0002-001，取得桃園指定雨量觀測站資料，並透過 Telegram Bot 自動發送雨量監測報告與雨量警報。
 
-本專案將原本的 n8n Workflow 改為 GitHub Actions 執行，不需要自行維護 n8n Server。
+本系統設計給 GitHub Actions 使用，可依排程自動執行。
 
-✨ 功能
+📋 功能
 
-每日自動查詢中央氣象署地面測站雨量資料
+本系統提供以下功能：
 
-使用台灣時區 Asia/Taipei
+取得中央氣象署 O-A0002-001 雨量資料
 
-每日自動執行 8 次：
+篩選桃園指定雨量測站
 
-08:00
+取得今日 0 時至目前累積雨量
 
-10:00
+取得 10 分鐘雨量
 
-12:00
+取得 1 小時雨量
 
-14:00
+取得 24 小時雨量
 
-16:00
+每個測站使用獨立雨量警戒門檻
 
-18:00
+雨量未達任何門檻的測站不輸出
 
-20:00
+任一雨量項目達到門檻時輸出測站
 
-22:00
+任一雨量項目達到門檻時發送 Telegram 警報
 
-自動取得桃園指定測站資料
+GitHub Actions 自動執行
 
-Telegram 自動推播每日雨量
-
-高雨量自動警報
-
-雨量警戒門檻可調整
-
-API Key 與 Telegram Token 使用 GitHub Secrets 管理
-
-支援 GitHub Actions 手動執行
-
-CWA 回傳 T、空值或非數字資料時進行安全處理
-
-同一測站有多筆資料時取最新日期資料
-
-🏗️ 系統架構
-GitHub Actions
-      │
-      ▼
- Python rain_monitor.py
-      │
-      ├───────────────► CWA API
-      │                    │
-      │                    ▼
-      │              C-B0025-001
-      │                    │
-      │                    ▼
-      │              桃園測站雨量
-      │
-      ├───────────────► Telegram Bot
-      │                    │
-      │                    ▼
-      │              每日雨量報告
-      │
-      └───────────────► 雨量警報判斷
-                           │
-                           ▼
-                    Telegram Alert
+支援 CWA API Debug 模式
 
 📁 專案結構
-taoyuan-rain-monitor/
-│
-├── .github/
-│   └── workflows/
-│       └── rain-monitor.yml
-│
+
+建議專案結構：
+
+.
 ├── rain_monitor.py
-│
-└── README.md
+├── README.md
+└── .github/
+    └── workflows/
+        └── rain_monitor.yml
 
-🔌 資料來源
+🌦️ 雨量警戒判斷邏輯
 
-本專案使用中央氣象署 Open Data：
+本系統不再使用單一雨量門檻判斷。
 
-資料集：C-B0025-001
+目前使用四個 Repository Secrets：
 
-地面測站每日雨量資料
-
-API：
-
-https://opendata.cwa.gov.tw/api/v1/rest/datastore/C-B0025-001
-
-
-主要使用資料：
-
-StationID
-StationName
-StationNameEN
-StationAttribute
-Date
-Precipitation
+RAIN_THRESHOLD_MM
+Past10Min_THRESHOLD_MM
+Past1hr_THRESHOLD_MM
+Past24hr_THRESHOLD_MM
 
 
-資料來源：
+分別對應：
 
-中央氣象署 Open Data。
+Repository Secret	CWA 資料欄位	說明
+RAIN_THRESHOLD_MM	Precipitation	今日 0 時至目前累積雨量
+Past10Min_THRESHOLD_MM	Past10Min	10 分鐘雨量
+Past1hr_THRESHOLD_MM	Past1hr	1 小時雨量
+Past24hr_THRESHOLD_MM	Past24hr	24 小時雨量
+🚨 測站輸出規則
 
-📍 監測測站
+每一個測站會獨立判斷四項雨量。
 
-目前程式監測以下測站：
+判斷公式：
+
+Precipitation >= RAIN_THRESHOLD_MM
+OR
+Past10Min >= Past10Min_THRESHOLD_MM
+OR
+Past1hr >= Past1hr_THRESHOLD_MM
+OR
+Past24hr >= Past24hr_THRESHOLD_MM
+
+任一項達到門檻
+→ 輸出該測站
+
+四項全部未達門檻
+→ 不輸出該測站
+
+
+例如設定：
+
+RAIN_THRESHOLD_MM        = 50
+Past10Min_THRESHOLD_MM   = 10
+Past1hr_THRESHOLD_MM     = 20
+Past24hr_THRESHOLD_MM    = 50
+
+
+測站資料：
+
+今日累積：20 mm
+10分鐘：5 mm
+1小時：10 mm
+24小時：30 mm
+
+
+四項全部未達門檻：
+
+20 < 50
+5  < 10
+10 < 20
+30 < 50
+
+
+因此：
+
+→ 不輸出
+
+
+如果測站資料為：
+
+今日累積：20 mm
+10分鐘：12 mm
+1小時：10 mm
+24小時：30 mm
+
+
+因為：
+
+12 >= 10
+
+
+所以：
+
+→ 輸出該測站
+→ 觸發雨量警報
+
+🔐 GitHub Repository Secrets
+
+進入：
+
+GitHub Repository
+    ↓
+Settings
+    ↓
+Secrets and variables
+    ↓
+Actions
+    ↓
+Repository secrets
+
+
+建立以下 Secrets。
+
+CWA API
+CWA_API_KEY
+
+
+用於存放中央氣象署 API Key。
+
+Telegram
+TELEGRAM_BOT_TOKEN
+TELEGRAM_CHAT_ID
+
+
+分別用於：
+
+Telegram Bot Token
+
+Telegram 接收訊息的 Chat ID
+
+雨量警戒門檻
+
+建立：
+
+RAIN_THRESHOLD_MM
+Past10Min_THRESHOLD_MM
+Past1hr_THRESHOLD_MM
+Past24hr_THRESHOLD_MM
+
+
+例如：
+
+RAIN_THRESHOLD_MM        = 50
+Past10Min_THRESHOLD_MM   = 10
+Past1hr_THRESHOLD_MM     = 20
+Past24hr_THRESHOLD_MM    = 50
+
+
+數值單位均為 mm。
+
+⚙️ GitHub Actions
+
+建立：
+
+.github/workflows/rain_monitor.yml
+
+
+範例：
+
+name: Taoyuan Rain Monitor
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    # GitHub Actions 使用 UTC
+    # 例：台灣時間每天 08:00
+    - cron: "0 0 * * *"
+
+jobs:
+
+  rain-monitor:
+
+    runs-on: ubuntu-latest
+
+    env:
+
+      CWA_API_KEY: ${{ secrets.CWA_API_KEY }}
+
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      RAIN_THRESHOLD_MM: ${{ secrets.RAIN_THRESHOLD_MM }}
+
+      Past10Min_THRESHOLD_MM: ${{ secrets.Past10Min_THRESHOLD_MM }}
+
+      Past1hr_THRESHOLD_MM: ${{ secrets.Past1hr_THRESHOLD_MM }}
+
+      Past24hr_THRESHOLD_MM: ${{ secrets.Past24hr_THRESHOLD_MM }}
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run rain monitor
+        run: python rain_monitor.py
+
+🕐 GitHub Actions 時區
+
+GitHub Actions 的 cron 使用 UTC。
+
+台灣時間為：
+
+UTC+8
+
+
+例如：
+
+台灣時間	UTC Cron
+08:00	0 0 * * *
+12:00	0 4 * * *
+18:00	0 10 * * *
+20:00	0 12 * * *
+
+例如每天台灣時間 08:00 執行：
+
+schedule:
+  - cron: "0 0 * * *"
+
+
+如果需要每 10 分鐘執行：
+
+schedule:
+  - cron: "*/10 * * * *"
+
+📍 桃園監測測站
+
+目前 rain_monitor.py 的 TARGET_STATIONS：
 
 大溪永福
 中大臨海站
@@ -144,9 +304,33 @@ Precipitation
 觀音
 中壢
 
-📊 Telegram 預設回報測站
 
-GitHub Actions 每次執行時，預設回報：
+如果需要增加或移除測站，可以修改：
+
+TARGET_STATIONS = [
+    ...
+]
+
+📊 每日 Telegram 報告測站
+
+每日報告目前只針對以下測站：
+
+DEFAULT_REPORT_STATIONS = [
+    "新屋",
+    "八德",
+    "蘆竹",
+    "龜山",
+    "中壢",
+]
+
+
+這與 TARGET_STATIONS 不同。
+
+也就是：
+
+每日報告
+
+只檢查：
 
 新屋
 八德
@@ -155,671 +339,391 @@ GitHub Actions 每次執行時，預設回報：
 中壢
 
 
-例如：
+而且：
+
+四項雨量全部未達門檻
+    ↓
+不輸出
+
+任一項達門檻
+    ↓
+輸出
+
+🚨 雨量警報測站
+
+雨量警報則會檢查：
+
+TARGET_STATIONS
+
+
+也就是目前設定的全部桃園測站。
+
+只要任一測站：
+
+今日累積雨量達標
+OR
+10分鐘雨量達標
+OR
+1小時雨量達標
+OR
+24小時雨量達標
+
+
+就會發送 Telegram 雨量警報。
+
+📱 Telegram 每日報告範例
+
+如果沒有任何指定每日報告測站達到門檻：
 
 🌧️ 桃園每日雨量監測
 ━━━━━━━━━━━━━━━━
-📅 資料日期：2026-09-25
+📅 資料日期：2026-09-26
+🕐 更新時間：2026-09-26 08:00:00
 📍 查詢測站：新屋、八德、蘆竹、龜山、中壢
 
+🚨 雨量警戒門檻
+   今日累積：50 mm
+   10分鐘：10 mm
+   1小時：20 mm
+   24小時：50 mm
+
+✅ 目前指定測站均未達任何雨量警戒門檻。
+
+📊 達警戒測站：0 筆
+🔎 資料來源：中央氣象署 O-A0002-001
+
+🌧️ 測站達警戒範例
+
+假設「新屋」：
+
+今日累積：30 mm
+10分鐘：12 mm
+1小時：15 mm
+24小時：40 mm
+
+
+門檻：
+
+今日累積：50 mm
+10分鐘：10 mm
+1小時：20 mm
+24小時：50 mm
+
+
+因為：
+
+10分鐘 12 >= 10
+
+
+所以新屋會被輸出。
+
+Telegram：
+
 📍 新屋
-   測站編號：C0C480
-   日期：2026-09-25
-   🌧️ 今日累積雨量：32 mm
-   測站類型：一般氣象站
-────────────────
+   測站編號：XXXX
+   觀測時間：2026-09-26T08:00:00+08:00
+   🌧️ 今日累積雨量：30 mm
+   🌧️ 10分鐘雨量：12 mm
+   🌧️ 1小時雨量：15 mm
+   🌧️ 24小時雨量：40 mm
+   🚨 達警戒：
+      • 10分鐘雨量 12 mm ≥ 10 mm
 
-📍 八德
-   測站編號：C0C590
-   日期：2026-09-25
-   ☀️ 今日累積雨量：0 mm
-   測站類型：一般氣象站
-────────────────
-
-📊 已取得 5 筆測站資料
-🔎 資料來源：中央氣象署 C-B0025-001
-
-
-實際測站編號、雨量與測站類型以 CWA API 當次回傳資料為準。
-
-🚨 高雨量警報
-
-系統會對監測測站進行高雨量判斷。
-
-目前預設：
-
-RAIN_THRESHOLD_MM=100
-
-
-判斷條件：
-
-Precipitation >= threshold
-
-
-例如某測站：
-
-今日累積雨量：125 mm
-
-
-則會觸發 Telegram 警報：
-
-🚨 桃園今日雨量警報
+🚨 Telegram 雨量警報範例
+🚨 桃園雨量警報
 ━━━━━━━━━━━━━━━━
-⚠️ 今日累積雨量達 100 mm 以上
+⚠️ 以下測站至少一項雨量達到警戒門檻
 
 📍 測站：新屋
-📅 日期：2026-09-25
-🌧️ 今日累積雨量：125 mm
-🆔 測站編號：C0C480
+🆔 測站編號：XXXX
+🕐 觀測時間：2026-09-26T08:00:00+08:00
+🚨 達標項目：
+   • 10分鐘 12 mm ≥ 10 mm
 
-🔎 資料來源：中央氣象署 C-B0025-001
-
-⚙️ 調整警戒門檻
-
-在：
-
-.github/workflows/rain-monitor.yml
+🔎 資料來源：中央氣象署 O-A0002-001
 
 
-修改：
+如果同一測站同時有多項達標，會全部列出。
 
-RAIN_THRESHOLD_MM: "100"
+例如：
 
+🚨 達標項目：
+   • 今日累積 60 mm ≥ 50 mm
+   • 1小時 25 mm ≥ 20 mm
+   • 24小時 70 mm ≥ 50 mm
 
-例如改成 350 mm：
+🔎 Debug 模式
 
-RAIN_THRESHOLD_MM: "350"
+預設：
 
-
-即可變成：
-
-Precipitation >= 350 mm
-
-
-才觸發警報。
-
-⏰ GitHub Actions 排程
-
-Workflow 使用：
-
-schedule:
-  - cron: "0 8,10,12,14,16,18,20,22 * * *"
-    timezone: "Asia/Taipei"
+DEBUG_CWA=false
 
 
-因此台灣時間每天：
+如果需要查看 CWA API JSON 結構，可以在 GitHub Actions 增加：
 
-08:00
-10:00
-12:00
-14:00
-16:00
-18:00
-20:00
-22:00
+env:
+  DEBUG_CWA: "true"
 
 
-執行一次。
+或在本機：
 
-另外提供：
-
-workflow_dispatch:
+DEBUG_CWA=true python rain_monitor.py
 
 
-因此可以從 GitHub Actions 頁面手動執行。
+Debug 模式會顯示：
 
-🔐 GitHub Secrets
+records 結構
 
-請至：
+CWA Station 數量
 
-Repository
-→ Settings
-→ Secrets and variables
-→ Actions
-→ New repository secret
+StationName
 
+StationId
 
-建立以下三個 Secrets。
+ObsTime
 
-CWA_API_KEY
+RainfallElement
 
-中央氣象署 API Key。
+目標測站雨量資料
 
-CWA_API_KEY
+💻 本機執行
 
-TELEGRAM_BOT_TOKEN
+需要 Python 3.10 以上。
 
-Telegram Bot Token。
+建議使用 Python 3.12。
 
-TELEGRAM_BOT_TOKEN
+設定環境變數：
 
-TELEGRAM_CHAT_ID
+Linux / macOS
+export CWA_API_KEY="你的CWA_API_KEY"
 
-Telegram 接收通知的 Chat ID。
+export TELEGRAM_BOT_TOKEN="你的Telegram_Bot_Token"
 
-TELEGRAM_CHAT_ID
+export TELEGRAM_CHAT_ID="你的Chat_ID"
 
+export RAIN_THRESHOLD_MM="50"
 
-完成後應該有：
+export Past10Min_THRESHOLD_MM="10"
 
-CWA_API_KEY
-TELEGRAM_BOT_TOKEN
-TELEGRAM_CHAT_ID
+export Past1hr_THRESHOLD_MM="20"
 
-🔒 安全性
-
-請不要將以下資訊直接寫入 Git Repository：
-
-CWA API Key
-Telegram Bot Token
-Telegram Chat ID
+export Past24hr_THRESHOLD_MM="50"
 
 
-不要在：
+執行：
 
-rain_monitor.py
+python rain_monitor.py
+
+🪟 Windows PowerShell
+$env:CWA_API_KEY="你的CWA_API_KEY"
+
+$env:TELEGRAM_BOT_TOKEN="你的Telegram_Bot_Token"
+
+$env:TELEGRAM_CHAT_ID="你的Chat_ID"
+
+$env:RAIN_THRESHOLD_MM="50"
+
+$env:Past10Min_THRESHOLD_MM="10"
+
+$env:Past1hr_THRESHOLD_MM="20"
+
+$env:Past24hr_THRESHOLD_MM="50"
 
 
-直接寫：
+執行：
+
+python rain_monitor.py
+
+🧪 測試警戒門檻
+
+可以暫時使用非常低的門檻測試 Telegram。
+
+例如：
+
+RAIN_THRESHOLD_MM        = 0
+Past10Min_THRESHOLD_MM   = 0
+Past1hr_THRESHOLD_MM     = 0
+Past24hr_THRESHOLD_MM    = 0
+
+
+這會讓所有有資料的測站都達到門檻。
+
+測試完成後，務必恢復正常門檻。
+
+⚠️ 注意事項
+1. API Key 不要寫進程式碼
+
+不要在 rain_monitor.py 裡直接寫：
 
 CWA_API_KEY = "xxxxxxxx"
 
 
-也不要在：
-
-rain-monitor.yml
-
-
-直接寫：
-
-TELEGRAM_BOT_TOKEN: "123456:ABC..."
-
-
-本專案使用 GitHub Secrets：
-
-CWA_API_KEY: ${{ secrets.CWA_API_KEY }}
-TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-
-🚀 安裝方式
-1. 建立 GitHub Repository
-
-例如：
-
-taoyuan-rain-monitor
-
-2. 建立目錄
-taoyuan-rain-monitor/
-├── .github/
-│   └── workflows/
-│       └── rain-monitor.yml
-├── rain_monitor.py
-└── README.md
-
-3. 上傳 Python 程式
-
-將：
-
-rain_monitor.py
-
-
-放在 Repository 根目錄。
-
-4. 建立 GitHub Actions
-
-建立：
-
-.github/workflows/rain-monitor.yml
-
-
-放入 Workflow 設定。
-
-5. 設定 Secrets
-
-建立：
+應使用 GitHub Repository Secrets：
 
 CWA_API_KEY
+
+2. Telegram Token 不要公開
+
+不要將：
+
 TELEGRAM_BOT_TOKEN
-TELEGRAM_CHAT_ID
-
-6. 啟用 Actions
-
-進入：
-
-Actions
 
 
-確認：
+提交到 Git。
 
-桃園每日雨量監測
+應使用：
 
+${{ secrets.TELEGRAM_BOT_TOKEN }}
 
-Workflow 已出現。
+3. 四個雨量門檻都必須設定
 
-🧪 手動測試
+以下四個 Secrets 都是必要的：
 
-進入：
-
-GitHub
-→ Actions
-→ 桃園每日雨量監測
-→ Run workflow
-→ Run workflow
+RAIN_THRESHOLD_MM
+Past10Min_THRESHOLD_MM
+Past1hr_THRESHOLD_MM
+Past24hr_THRESHOLD_MM
 
 
-GitHub Runner 將執行：
+缺少其中任何一個，程式會停止並顯示：
 
-Checkout
-↓
-Setup Python
-↓
-Verify configuration
-↓
-Run Taoyuan Rain Monitor
-↓
-CWA API
-↓
-雨量資料處理
-↓
-Telegram
+缺少雨量警戒門檻環境變數
 
-🐍 Python 版本
+4. 門檻必須是數字
 
-目前 Workflow 使用：
+正確：
 
-Python 3.12
+50
+10
+20
+50
 
 
-程式只使用 Python Standard Library，因此不需要：
+也可以：
 
-requirements.txt
+50.0
+10.5
+20.0
+50.5
 
 
-也不需要額外安裝：
+錯誤：
 
-requests
-pandas
-numpy
-python-telegram-bot
+50mm
+十
+10分鐘10mm
 
-🧮 雨量資料處理
+5. 雨跡 T
 
-CWA 回傳：
+CWA 的：
 
 T
 
 
-代表微量雨。
+代表雨跡。
 
-本專案沿用原 n8n Workflow 的處理方式：
+本程式會將：
 
 T → 0 mm
 
 
-空值：
-
-"" → 0 mm
-
-
-無法轉換的資料：
-
-invalid → 0 mm
-
-
-因此不會因為：
-
-NaN
-null
-T
-空字串
-
-
-導致警報判斷失敗。
-
-📅 今日日期
-
-程式使用：
-
-Asia/Taipei
-
-
-取得目前台灣日期。
-
-因此 GitHub Runner 即使使用 UTC，也不會直接拿 UTC 日期當作雨量查詢日期。
-
-例如台灣：
-
-2026-09-25 07:30
-
-
-程式會使用：
-
-2026-09-25
-
-
-作為 CWA API 的：
-
-timeFrom
-
-📡 CWA API 流程
-
-程式會呼叫：
-
-C-B0025-001
-
-
-並傳入：
-
-format=JSON
-DataType=stationObsTimes
-timeFrom=YYYY-MM-DD
-
-
-例如：
-
-format=JSON
-DataType=stationObsTimes
-timeFrom=2026-09-25
-
-
-取得資料後：
-
-records
-  ↓
-location
-  ↓
-station
-  ↓
-stationObsTimes
-  ↓
-stationObsTime
-  ↓
-weatherElements
-  ↓
-Precipitation
-
-📍 測站篩選
-
-Python 會先取得 CWA API 回傳的所有測站。
-
-接著只保留：
-
-TARGET_STATIONS
-
-
-裡面的測站。
-
-因此即使 API 回傳其他縣市測站，也不會進入桃園監測結果。
-
-🔎 同測站多筆資料
-
-如果 API 回傳相同測站多筆資料，程式會依：
-
-Date
-
-
-比較並保留日期最新的一筆。
-
-這可以避免同一測站重複出現在 Telegram 報告。
-
-📤 Telegram API
-
-Telegram 使用：
-
-sendMessage
-
-
-發送文字訊息。
-
-程式會將：
-
-每日雨量報告
-
-
-與：
-
-高雨量警報
-
-
-分別發送。
-
-⚠️ GitHub Actions 注意事項
-
-GitHub Actions 的 scheduled workflow 並不是即時排程服務。
-
-在 GitHub Actions 負載較高時，scheduled workflow 可能出現延遲。
-
-因此：
-
-08:00
-
-
-應理解為：
-
-預定約 08:00 執行
-
-
-而不是保證精確到秒。
-
-如果是非常嚴格的即時監測需求，建議使用專門的排程服務。
-
-🔧 常見問題
-CWA API 沒有資料
-
-先確認：
-
-CWA_API_KEY
-
-
-是否正確。
-
-也確認 CWA API 是否正常回傳：
-
-records.location
-
-Telegram 沒有收到訊息
-
-確認：
-
-TELEGRAM_BOT_TOKEN
-TELEGRAM_CHAT_ID
-
-
-是否正確。
-
-並確認 Telegram 使用者或群組已經和 Bot 建立有效的聊天關係。
-
-GitHub Actions 沒有自動執行
-
-確認：
+因此不會因為雨跡而觸發雨量警戒。
+
+📡 資料來源
+
+資料集：
+
+CWA O-A0002-001
+
+
+資料來源為中央氣象署開放資料平台。
+
+本程式主要使用：
+
+RainfallElement.Now.Precipitation
+RainfallElement.Past10Min.Precipitation
+RainfallElement.Past1hr.Precipitation
+RainfallElement.Past24hr.Precipitation
+
+🔄 系統流程
+GitHub Actions
+      │
+      ▼
+執行 rain_monitor.py
+      │
+      ▼
+讀取 Repository Secrets
+      │
+      ├── CWA_API_KEY
+      ├── TELEGRAM_BOT_TOKEN
+      ├── TELEGRAM_CHAT_ID
+      │
+      ├── RAIN_THRESHOLD_MM
+      ├── Past10Min_THRESHOLD_MM
+      ├── Past1hr_THRESHOLD_MM
+      └── Past24hr_THRESHOLD_MM
+      │
+      ▼
+取得 CWA O-A0002-001
+      │
+      ▼
+篩選桃園指定測站
+      │
+      ▼
+取得各測站
+      │
+      ├── 今日累積雨量
+      ├── 10分鐘雨量
+      ├── 1小時雨量
+      └── 24小時雨量
+      │
+      ▼
+逐測站判斷
+      │
+      ├── 任一項達門檻
+      │       │
+      │       ├── 每日報告 → 輸出
+      │       └── 警報 → Telegram
+      │
+      └── 四項全部未達
+              │
+              └── 不輸出
+
+📌 核心規則總結
+條件	每日報告	雨量警報
+四項全部未達門檻	❌ 不輸出	❌ 不警報
+今日累積達標	✅ 輸出	🚨 警報
+10 分鐘達標	✅ 輸出	🚨 警報
+1 小時達標	✅ 輸出	🚨 警報
+24 小時達標	✅ 輸出	🚨 警報
+多項同時達標	✅ 輸出	🚨 警報並列出全部達標項目
+📄 主要檔案
+檔案	功能
+rain_monitor.py	雨量資料取得、判斷與 Telegram 通知
+README.md	專案說明
+.github/workflows/rain_monitor.yml	GitHub Actions 自動執行設定
+✅ 完成設定後
+
+確認 GitHub Repository 已設定：
+
+☑ CWA_API_KEY
+☑ TELEGRAM_BOT_TOKEN
+☑ TELEGRAM_CHAT_ID
+☑ RAIN_THRESHOLD_MM
+☑ Past10Min_THRESHOLD_MM
+☑ Past1hr_THRESHOLD_MM
+☑ Past24hr_THRESHOLD_MM
+
+
+然後在：
 
 Actions
-→ 桃園每日雨量監測
-
-
-是否啟用。
-
-也可以先使用：
-
+    ↓
+Taoyuan Rain Monitor
+    ↓
 Run workflow
 
 
-進行手動測試。
+手動執行一次確認。
 
-警報一直沒有出現
-
-確認：
-
-RAIN_THRESHOLD_MM: "100"
-
-
-門檻是否高於目前測站雨量。
-
-也可以暫時降低，例如：
-
-RAIN_THRESHOLD_MM: "1"
-
-
-測試 Telegram 警報流程。
-
-測試完成後記得恢復正式門檻。
-
-🛠️ 自訂自動回報測站
-
-修改：
-
-DEFAULT_REPORT_STATIONS = [
-    "新屋",
-    "八德",
-    "蘆竹",
-    "龜山",
-    "中壢",
-]
-
-
-例如：
-
-DEFAULT_REPORT_STATIONS = [
-    "新屋",
-    "八德",
-    "蘆竹",
-    "龜山",
-    "中壢",
-    "桃園",
-    "楊梅",
-]
-
-
-即可增加每日 Telegram 回報測站。
-
-但該測站必須同時存在於：
-
-TARGET_STATIONS
-
-➕ 新增監測測站
-
-在：
-
-TARGET_STATIONS
-
-
-增加 CWA API 使用的正式測站名稱：
-
-TARGET_STATIONS = [
-    ...
-    "新測站名稱",
-]
-
-
-測站名稱必須與 CWA API 的：
-
-StationName
-
-
-完全一致。
-
-📈 未來可以擴充
-
-本專案可以進一步加入：
-
-24 小時累積雨量
-
-48 小時累積雨量
-
-72 小時累積雨量
-
-每小時雨量
-
-桃園雨量排行榜
-
-最大雨量測站
-
-多級警報
-
-100 / 200 / 350 / 500 mm 警戒
-
-重複警報抑制
-
-警報歷史紀錄
-
-GitHub Issues 自動建立
-
-CSV 歷史資料
-
-SQLite / PostgreSQL
-
-Email 通知
-
-LINE 通知
-
-Discord 通知
-
-Telegram 指令查詢
-
-Telegram 指定測站查詢
-
-每日雨量統計圖
-
-GitHub Pages 儀表板
-
-🔄 與原 n8n Workflow 對照
-原 n8n	GitHub Actions 版本
-Schedule Trigger	GitHub Actions schedule
-Request Router	Python 主程式
-CWA API HTTP Request	Python urllib
-Normalize CWA Data	normalize_data()
-Detect Requested Stations	station_map
-Build Telegram Report	build_report()
-Send Rain Report	send_telegram()
-Rain Alert Engine	find_alerts()
-Alert Required?	if triggered:
-Send Rain Alert	send_telegram()
-n8n Credentials	GitHub Secrets
-Asia/Taipei	Workflow timezone + Python ZoneInfo
-📜 授權與資料來源
-
-本專案程式碼可依專案需求自行修改。
-
-氣象資料來源：
-
-中央氣象署 Open Data
-C-B0025-001
-地面測站每日雨量資料
-
-
-實際資料內容、測站狀態與 API 服務狀態以中央氣象署提供資料為準。
-
-📌 快速開始
-
-完成以下三件事即可使用：
-
-1. 上傳 rain_monitor.py
-2. 上傳 .github/workflows/rain-monitor.yml
-3. 設定 CWA_API_KEY、TELEGRAM_BOT_TOKEN、TELEGRAM_CHAT_ID
-
-
-然後：
-
-GitHub
-→ Actions
-→ 桃園每日雨量監測
-→ Run workflow
-
-
-即可進行第一次測試。
-
-之後 GitHub Actions 會依：
-
-Asia/Taipei
-
-08:00
-10:00
-12:00
-14:00
-16:00
-18:00
-20:00
-22:00
-
-
-自動執行桃園雨量監測。
+執行成功後，GitHub Actions 就會依照 .github/workflows/rain_monitor.yml 的 schedule 自動執行。
