@@ -6,7 +6,7 @@ on:
   schedule:
     # GitHub Actions 支援 timezone
     # 桃園使用 Asia/Taipei
-    - cron: "0 8,10,12,14,16,18,20,22 * * *"
+    - cron: "0 6,7,8,7,10,11,12,13,14,15,16,17,18,19,20,21,22,23 * * *"
       timezone: "Asia/Taipei"
 
 permissions:
@@ -28,10 +28,11 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
-      # 原 n8n Rain Alert Engine 實際程式為 100 mm。
-      # 如果你要使用 Sticky Note 所寫的 350 mm，
-      # 改成 350。
-      RAIN_THRESHOLD_MM: "100"
+      RAIN_THRESHOLD_MM: ${{ secrets.RAIN_THRESHOLD_MM }}
+      Past10Min_THRESHOLD_MM: ${{ secrets.Past10Min_THRESHOLD_MM }}
+      Past1hr_THRESHOLD_MM: ${{ secrets.Past1hr_THRESHOLD_MM}}
+      Past24hr_THRESHOLD_MM: ${{ secrets.Past24hr_THRESHOLD_MM }}
+      
 
     steps:
       - name: Checkout
@@ -59,6 +60,26 @@ jobs:
 
           if [[ -z "${TELEGRAM_CHAT_ID}" ]]; then
             echo "❌ TELEGRAM_CHAT_ID 未設定"
+            exit 1
+          fi
+
+          if [[ -z "${RAIN_THRESHOLD_MM}" ]]; then
+            echo "❌ RAIN_THRESHOLD_MM 未設定"
+            exit 1
+          fi
+
+          if [[ -z "${Past10Min_THRESHOLD_MM}" ]]; then
+            echo "❌ RAIN_THRESHOLD_MM 未設定"
+            exit 1
+          fi
+
+          if [[ -z "${Past1hr_THRESHOLD_MM}" ]]; then
+            echo "❌ Past1hr_THRESHOLD_MM 未設定"
+            exit 1
+          fi
+
+          if [[ -z "${Past24hr_THRESHOLD_MM}" ]]; then
+            echo "❌ Past24hr_THRESHOLD_MM 未設定"
             exit 1
           fi
 
