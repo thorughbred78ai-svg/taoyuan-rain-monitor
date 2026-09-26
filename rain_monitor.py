@@ -12,24 +12,54 @@
     1. 取得 CWA 即時雨量資料
     2. 篩選桃園指定測站
     3. 取得「今日 0 時至目前」累積雨量
-    4. Telegram 推送每日監測報告
-    5. 雨量達門檻時發送警報
-    6. GitHub Actions 可直接執行
+    4. 取得 10 分鐘、1 小時、24 小時雨量
+    5. 依四組 Repository Secrets 判斷雨量警戒
+    6. 四項全部未達門檻 → 不輸出該測站
+    7. 任一項達到門檻 → 輸出該測站
+    8. Telegram 推送每日監測報告
+    9. 達任一雨量警戒門檻時發送警報
+    10. GitHub Actions 可直接執行
 
 必要環境變數：
     CWA_API_KEY
     TELEGRAM_BOT_TOKEN
     TELEGRAM_CHAT_ID
 
-可選環境變數：
+雨量警戒環境變數 / GitHub Repository Secrets：
     RAIN_THRESHOLD_MM
+        → 今日 0 時至目前累積雨量 Precipitation
+
+    Past10Min_THRESHOLD_MM
+        → 10 分鐘雨量 Past10Min
+
+    Past1hr_THRESHOLD_MM
+        → 1 小時雨量 Past1hr
+
+    Past24hr_THRESHOLD_MM
+        → 24 小時雨量 Past24hr
+
+可選環境變數：
     DEBUG_CWA
 
+警戒判斷邏輯：
+
+    Precipitation >= RAIN_THRESHOLD_MM
+        OR
+    Past10Min >= Past10Min_THRESHOLD_MM
+        OR
+    Past1hr >= Past1hr_THRESHOLD_MM
+        OR
+    Past24hr >= Past24hr_THRESHOLD_MM
+
+    任一項達到門檻：
+        → 輸出測站
+
+    四項全部低於門檻：
+        → 不輸出測站
 """
 
 import json
 import os
-import sys
 from datetime import datetime
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -46,8 +76,6 @@ CWA_API_URL = (
     "https://opendata.cwa.gov.tw/api/v1/rest/datastore/"
     f"{CWA_DATASET_ID}"
 )
-
-DEFAULT_RAIN_THRESHOLD = 100.0
 
 
 # ============================================================
@@ -89,7 +117,7 @@ TARGET_STATIONS = [
 
 
 # ============================================================
-# GitHub Actions / 自動 Telegram 回報
+# Telegram 每日回報測站
 # ============================================================
 
 DEFAULT_REPORT_STATIONS = [
@@ -105,19 +133,103 @@ DEFAULT_REPORT_STATIONS = [
 # 環境變數
 # ============================================================
 
-def get_env(name: str, required: bool = True) -> str:
+def get_env(
+    name: str,
+    required: bool = True,
+) -> str:
     """
     取得環境變數。
     """
 
-    value = os.getenv(name, "").strip()
+    value = os.getenv(
+        name,
+        "",
+    ).strip()
 
     if required and not value:
+
         raise RuntimeError(
             f"缺少必要環境變數：{name}"
         )
 
     return value
+
+
+def get_rain_thresholds() -> dict[str, float]:
+    """
+    取得四項雨量警戒門檻。
+
+    GitHub Repository Secrets：
+
+        RAIN_THRESHOLD_MM
+            → Precipitation
+
+        Past10Min_THRESHOLD_MM
+            → Past10Min
+
+        Past1hr_THRESHOLD_MM
+            → Past1hr
+
+        Past24hr_THRESHOLD_MM
+            → Past24hr
+
+    回傳：
+
+        {
+            "RAIN": float,
+            "Past10Min": float,
+            "Past1hr": float,
+            "Past24hr": float,
+        }
+    """
+
+    env_names = {
+        "RAIN": "RAIN_THRESHOLD_MM",
+        "Past10Min": "Past10Min_THRESHOLD_MM",
+        "Past1hr": "Past1hr_THRESHOLD_MM",
+        "Past24hr": "Past24hr_THRESHOLD_MM",
+    }
+
+    thresholds = {}
+
+    for rain_type, env_name in env_names.items():
+
+        value = os.getenv(
+            env_name,
+            "",
+        ).strip()
+
+        if not value:
+
+            raise RuntimeError(
+                "缺少雨量警戒門檻環境變數："
+                f"{env_name}"
+            )
+
+        try:
+
+            threshold = float(
+                value
+            )
+
+        except ValueError:
+
+            raise RuntimeError(
+                f"{env_name} 必須是數字，"
+                f"目前值：{value}"
+            )
+
+        if threshold < 0:
+
+            raise RuntimeError(
+                f"{env_name} 不可以小於 0"
+            )
+
+        thresholds[
+            rain_type
+        ] = threshold
+
+    return thresholds
 
 
 # ============================================================
@@ -130,6 +242,7 @@ def get_taipei_now() -> datetime:
     """
 
     try:
+
         from zoneinfo import ZoneInfo
 
         return datetime.now(
@@ -137,6 +250,7 @@ def get_taipei_now() -> datetime:
         )
 
     except Exception:
+
         # GitHub Actions 通常使用 UTC，
         # 因此這裡僅作為 fallback。
         return datetime.now()
@@ -156,24 +270,32 @@ def get_today() -> str:
 # 數值處理
 # ============================================================
 
-def parse_precipitation(raw) -> float:
+def parse_precipitation(
+    raw,
+) -> float:
     """
     將 CWA 雨量欄位轉換成 float。
 
     CWA 常見值：
+
         T       雨跡
         -       無資料
+        --      無資料
         -98     特殊值
         -99     特殊值
 
     對於警報判斷：
-        T / 空值 / 非數字 → 0
+
+        T / 空值 / 非數字
+            → 0
     """
 
     if raw is None:
         return 0.0
 
-    value = str(raw).strip()
+    value = str(
+        raw
+    ).strip()
 
     if value == "":
         return 0.0
@@ -183,17 +305,26 @@ def parse_precipitation(raw) -> float:
         return 0.0
 
     # 特殊缺值
-    if value in ("-", "--"):
+    if value in (
+        "-",
+        "--",
+    ):
         return 0.0
 
     # CWA 特殊缺值
-    if value in ("-98", "-99"):
+    if value in (
+        "-98",
+        "-99",
+    ):
         return 0.0
 
     try:
 
-        number = float(value)
+        number = float(
+            value
+        )
 
+        # NaN
         if not number == number:
             return 0.0
 
@@ -201,7 +332,7 @@ def parse_precipitation(raw) -> float:
 
     except (
         TypeError,
-        ValueError
+        ValueError,
     ):
 
         return 0.0
@@ -237,7 +368,9 @@ def fetch_json(
                 "utf-8"
             )
 
-            return json.loads(body)
+            return json.loads(
+                body
+            )
 
     except HTTPError as exc:
 
@@ -336,7 +469,10 @@ def debug_cwa_structure(
 
     stations = []
 
-    if isinstance(records, dict):
+    if isinstance(
+        records,
+        dict,
+    ):
 
         stations = (
             records.get("Station")
@@ -344,8 +480,14 @@ def debug_cwa_structure(
             or []
         )
 
-    if isinstance(stations, dict):
-        stations = [stations]
+    if isinstance(
+        stations,
+        dict,
+    ):
+
+        stations = [
+            stations
+        ]
 
     print(
         "CWA Station count:",
@@ -412,6 +554,7 @@ def debug_cwa_structure(
     print(
         "================================"
     )
+
     print("")
 
 
@@ -435,10 +578,16 @@ def normalize_data(
              │    └── DateTime
              │
              └── RainfallElement
-                  └── Now
-                       └── Precipitation
+                  ├── Now
+                  ├── Past10Min
+                  ├── Past1hr
+                  ├── Past3hr
+                  ├── Past6hr
+                  ├── Past12hr
+                  └── Past24hr
 
-    Now = 本日 0 時至目前累積雨量。
+    Now：
+        本日 0 時至目前累積雨量。
     """
 
     records = (
@@ -453,6 +602,7 @@ def normalize_data(
         records,
         dict,
     ):
+
         return []
 
     stations = (
@@ -469,12 +619,16 @@ def normalize_data(
         stations,
         dict,
     ):
-        stations = [stations]
+
+        stations = [
+            stations
+        ]
 
     if not isinstance(
         stations,
         list,
     ):
+
         return []
 
     output = []
@@ -485,6 +639,7 @@ def normalize_data(
             station,
             dict,
         ):
+
             continue
 
         # ----------------------------------------------------
@@ -537,6 +692,7 @@ def normalize_data(
             obs_time,
             dict,
         ):
+
             obs_time = {}
 
         date_time = (
@@ -561,6 +717,7 @@ def normalize_data(
             geo_info,
             dict,
         ):
+
             geo_info = {}
 
         county_name = (
@@ -599,6 +756,7 @@ def normalize_data(
             rainfall,
             dict,
         ):
+
             rainfall = {}
 
         # ----------------------------------------------------
@@ -618,6 +776,7 @@ def normalize_data(
             now_data,
             dict,
         ):
+
             now_data = {}
 
         raw_precipitation = (
@@ -626,10 +785,8 @@ def normalize_data(
             )
         )
 
-        precipitation = (
-            parse_precipitation(
-                raw_precipitation
-            )
+        precipitation = parse_precipitation(
+            raw_precipitation
         )
 
         # ----------------------------------------------------
@@ -651,6 +808,7 @@ def normalize_data(
                 period,
                 dict,
             ):
+
                 return 0.0
 
             return parse_precipitation(
@@ -690,6 +848,7 @@ def normalize_data(
         date_str = ""
 
         if date_time:
+
             date_str = str(
                 date_time
             )[:10]
@@ -739,8 +898,7 @@ def normalize_data(
 
                 "PrecipitationRaw": (
                     ""
-                    if raw_precipitation
-                    is None
+                    if raw_precipitation is None
                     else str(
                         raw_precipitation
                     )
@@ -854,6 +1012,152 @@ def latest_station_rows(
 
 
 # ============================================================
+# 判斷測站是否達到雨量警戒
+# ============================================================
+
+def station_reaches_threshold(
+    data: dict,
+    thresholds: dict[str, float],
+) -> bool:
+    """
+    判斷測站是否至少有一項雨量達到警戒門檻。
+
+    任一項達到門檻：
+        True
+
+    四項全部低於門檻：
+        False
+    """
+
+    rain = float(
+        data.get(
+            "Precipitation",
+            0,
+        )
+    )
+
+    past_10_min = float(
+        data.get(
+            "Past10Min",
+            0,
+        )
+    )
+
+    past_1hr = float(
+        data.get(
+            "Past1hr",
+            0,
+        )
+    )
+
+    past_24hr = float(
+        data.get(
+            "Past24hr",
+            0,
+        )
+    )
+
+    return (
+        rain >= thresholds["RAIN"]
+        or
+        past_10_min >= thresholds["Past10Min"]
+        or
+        past_1hr >= thresholds["Past1hr"]
+        or
+        past_24hr >= thresholds["Past24hr"]
+    )
+
+
+# ============================================================
+# 找出達警戒的雨量項目
+# ============================================================
+
+def get_triggered_items(
+    data: dict,
+    thresholds: dict[str, float],
+) -> list[str]:
+    """
+    回傳測站目前達到警戒門檻的項目。
+    """
+
+    triggered = []
+
+    rain = float(
+        data.get(
+            "Precipitation",
+            0,
+        )
+    )
+
+    past_10_min = float(
+        data.get(
+            "Past10Min",
+            0,
+        )
+    )
+
+    past_1hr = float(
+        data.get(
+            "Past1hr",
+            0,
+        )
+    )
+
+    past_24hr = float(
+        data.get(
+            "Past24hr",
+            0,
+        )
+    )
+
+    if rain >= thresholds["RAIN"]:
+
+        triggered.append(
+            (
+                "今日累積雨量 "
+                f"{rain:g} mm "
+                "≥ "
+                f"{thresholds['RAIN']:g} mm"
+            )
+        )
+
+    if past_10_min >= thresholds["Past10Min"]:
+
+        triggered.append(
+            (
+                "10分鐘雨量 "
+                f"{past_10_min:g} mm "
+                "≥ "
+                f"{thresholds['Past10Min']:g} mm"
+            )
+        )
+
+    if past_1hr >= thresholds["Past1hr"]:
+
+        triggered.append(
+            (
+                "1小時雨量 "
+                f"{past_1hr:g} mm "
+                "≥ "
+                f"{thresholds['Past1hr']:g} mm"
+            )
+        )
+
+    if past_24hr >= thresholds["Past24hr"]:
+
+        triggered.append(
+            (
+                "24小時雨量 "
+                f"{past_24hr:g} mm "
+                "≥ "
+                f"{thresholds['Past24hr']:g} mm"
+            )
+        )
+
+    return triggered
+
+
+# ============================================================
 # 建立每日 Telegram 報告
 # ============================================================
 
@@ -861,7 +1165,19 @@ def build_report(
     station_map: dict[str, dict],
     requested_stations: list[str],
     date_str: str,
+    thresholds: dict[str, float],
 ) -> str:
+    """
+    建立每日 Telegram 報告。
+
+    規則：
+
+        四項雨量全部未達門檻
+            → 不輸出該測站
+
+        任一項達到門檻
+            → 輸出該測站
+    """
 
     now = get_taipei_now()
 
@@ -878,11 +1194,27 @@ def build_report(
             f"{'、'.join(requested_stations)}"
         ),
         "",
+        "🚨 雨量警戒門檻",
+        (
+            "   今日累積："
+            f"{thresholds['RAIN']:g} mm"
+        ),
+        (
+            "   10分鐘："
+            f"{thresholds['Past10Min']:g} mm"
+        ),
+        (
+            "   1小時："
+            f"{thresholds['Past1hr']:g} mm"
+        ),
+        (
+            "   24小時："
+            f"{thresholds['Past24hr']:g} mm"
+        ),
+        "",
     ]
 
     found_count = 0
-
-    not_found = []
 
     for station_name in requested_stations:
 
@@ -891,10 +1223,17 @@ def build_report(
         )
 
         if not data:
+            continue
 
-            not_found.append(
-                station_name
-            )
+        # ----------------------------------------------------
+        # 四項全部未達門檻
+        # → 完全不輸出該測站
+        # ----------------------------------------------------
+
+        if not station_reaches_threshold(
+            data,
+            thresholds,
+        ):
 
             continue
 
@@ -907,10 +1246,30 @@ def build_report(
             )
         )
 
-        rain_icon = (
-            "🌧️"
-            if rain > 0
-            else "☀️"
+        past_10_min = float(
+            data.get(
+                "Past10Min",
+                0,
+            )
+        )
+
+        past_1hr = float(
+            data.get(
+                "Past1hr",
+                0,
+            )
+        )
+
+        past_24hr = float(
+            data.get(
+                "Past24hr",
+                0,
+            )
+        )
+
+        triggered_items = get_triggered_items(
+            data,
+            thresholds,
         )
 
         lines.extend(
@@ -928,43 +1287,48 @@ def build_report(
                 ),
 
                 (
-                    f"   {rain_icon} "
-                    "今日累積雨量："
+                    "   🌧️ 今日累積雨量："
                     f"{rain:g} mm"
                 ),
 
                 (
-                    "   10分鐘雨量："
-                    f"{float(data.get('Past10Min', 0)):g} mm"
+                    "   🌧️ 10分鐘雨量："
+                    f"{past_10_min:g} mm"
                 ),
 
                 (
-                    "   1小時雨量："
-                    f"{float(data.get('Past1hr', 0)):g} mm"
+                    "   🌧️ 1小時雨量："
+                    f"{past_1hr:g} mm"
                 ),
 
                 (
-                    "   24小時雨量："
-                    f"{float(data.get('Past24hr', 0)):g} mm"
+                    "   🌧️ 24小時雨量："
+                    f"{past_24hr:g} mm"
                 ),
 
-                (
-                    "   測站類型："
-                    f"{data.get('StationAttribute') or '雨量觀測站'}"
-                ),
-
-                "────────────────",
+                "   🚨 達警戒：",
             ]
         )
 
-    if not_found:
+        for item in triggered_items:
+
+            lines.append(
+                f"      • {item}"
+            )
+
+        lines.append(
+            "────────────────"
+        )
+
+    # --------------------------------------------------------
+    # 沒有任何測站達到門檻
+    # --------------------------------------------------------
+
+    if found_count == 0:
 
         lines.extend(
             [
-                (
-                    "⚠️ 無資料："
-                    f"{'、'.join(not_found)}"
-                ),
+                "✅ 目前指定測站均未達任何雨量警戒門檻。",
                 "",
             ]
         )
@@ -972,8 +1336,8 @@ def build_report(
     lines.extend(
         [
             (
-                f"📊 已取得 {found_count} "
-                "筆測站資料"
+                f"📊 達警戒測站："
+                f"{found_count} 筆"
             ),
             (
                 "🔎 資料來源："
@@ -982,19 +1346,23 @@ def build_report(
         ]
     )
 
-    return "\n".join(lines)
+    return "\n".join(
+        lines
+    )
 
 
 # ============================================================
-# 建立高雨量警報
+# 找出所有達警戒測站
 # ============================================================
 
 def find_alerts(
     station_map: dict[str, dict],
-    threshold: float,
+    thresholds: dict[str, float],
 ) -> list[dict]:
     """
-    找出達到雨量門檻的測站。
+    找出至少一項雨量達到警戒門檻的測站。
+
+    這裡檢查 TARGET_STATIONS 的全部測站。
     """
 
     triggered = []
@@ -1008,14 +1376,10 @@ def find_alerts(
         if not data:
             continue
 
-        precipitation = float(
-            data.get(
-                "Precipitation",
-                0,
-            )
-        )
-
-        if precipitation >= threshold:
+        if station_reaches_threshold(
+            data,
+            thresholds,
+        ):
 
             triggered.append(
                 data
@@ -1024,36 +1388,111 @@ def find_alerts(
     return triggered
 
 
+# ============================================================
+# 建立高雨量警報
+# ============================================================
+
 def build_alert(
     triggered: list[dict],
-    threshold: float,
+    thresholds: dict[str, float],
 ) -> str:
+    """
+    建立雨量警報。
+
+    任一雨量項目達到各自門檻即可進入警報。
+    """
 
     lines = [
-        "🚨 桃園今日雨量警報",
+        "🚨 桃園雨量警報",
         "━━━━━━━━━━━━━━━━",
-        (
-            f"⚠️ 今日累積雨量達 "
-            f"{threshold:g} mm 以上"
-        ),
+        "⚠️ 以下測站至少一項雨量達到警戒門檻",
         "",
     ]
 
     for station in triggered:
 
-        precipitation = float(
+        station_name = station.get(
+            "StationName",
+            "無資料",
+        )
+
+        rain = float(
             station.get(
                 "Precipitation",
                 0,
             )
         )
 
+        past_10_min = float(
+            station.get(
+                "Past10Min",
+                0,
+            )
+        )
+
+        past_1hr = float(
+            station.get(
+                "Past1hr",
+                0,
+            )
+        )
+
+        past_24hr = float(
+            station.get(
+                "Past24hr",
+                0,
+            )
+        )
+
+        alert_items = []
+
+        if rain >= thresholds["RAIN"]:
+
+            alert_items.append(
+                (
+                    "今日累積 "
+                    f"{rain:g} mm"
+                    " ≥ "
+                    f"{thresholds['RAIN']:g} mm"
+                )
+            )
+
+        if past_10_min >= thresholds["Past10Min"]:
+
+            alert_items.append(
+                (
+                    "10分鐘 "
+                    f"{past_10_min:g} mm"
+                    " ≥ "
+                    f"{thresholds['Past10Min']:g} mm"
+                )
+            )
+
+        if past_1hr >= thresholds["Past1hr"]:
+
+            alert_items.append(
+                (
+                    "1小時 "
+                    f"{past_1hr:g} mm"
+                    " ≥ "
+                    f"{thresholds['Past1hr']:g} mm"
+                )
+            )
+
+        if past_24hr >= thresholds["Past24hr"]:
+
+            alert_items.append(
+                (
+                    "24小時 "
+                    f"{past_24hr:g} mm"
+                    " ≥ "
+                    f"{thresholds['Past24hr']:g} mm"
+                )
+            )
+
         lines.extend(
             [
-                (
-                    "📍 測站："
-                    f"{station.get('StationName', '無資料')}"
-                ),
+                f"📍 測站：{station_name}",
 
                 (
                     "🆔 測站編號："
@@ -1065,16 +1504,18 @@ def build_alert(
                     f"{station.get('DateTime') or '無資料'}"
                 ),
 
-                (
-                    "🌧️ 今日累積雨量："
-                    f"{precipitation:g} mm"
-                ),
+                "🚨 達標項目：",
+            ]
+        )
 
-                (
-                    "📊 24小時雨量："
-                    f"{float(station.get('Past24hr', 0)):g} mm"
-                ),
+        for item in alert_items:
 
+            lines.append(
+                f"   • {item}"
+            )
+
+        lines.extend(
+            [
                 "",
             ]
         )
@@ -1084,7 +1525,9 @@ def build_alert(
         "中央氣象署 O-A0002-001"
     )
 
-    return "\n".join(lines)
+    return "\n".join(
+        lines
+    )
 
 
 # ============================================================
@@ -1101,11 +1544,13 @@ def send_telegram(
     """
 
     if not bot_token:
+
         raise RuntimeError(
             "TELEGRAM_BOT_TOKEN 未設定"
         )
 
     if not chat_id:
+
         raise RuntimeError(
             "TELEGRAM_CHAT_ID 未設定"
         )
@@ -1206,24 +1651,11 @@ def main() -> int:
         "TELEGRAM_CHAT_ID"
     )
 
-    threshold_text = os.getenv(
-        "RAIN_THRESHOLD_MM",
-        str(
-            DEFAULT_RAIN_THRESHOLD
-        ),
-    ).strip()
+    # --------------------------------------------------------
+    # 四項雨量警戒門檻
+    # --------------------------------------------------------
 
-    try:
-
-        rain_threshold = float(
-            threshold_text
-        )
-
-    except ValueError:
-
-        raise RuntimeError(
-            "RAIN_THRESHOLD_MM 必須是數字"
-        )
+    rain_thresholds = get_rain_thresholds()
 
     debug_enabled = (
         os.getenv(
@@ -1256,7 +1688,26 @@ def main() -> int:
 
     print(
         "雨量警戒門檻："
-        f"{rain_threshold:g} mm"
+    )
+
+    print(
+        "  RAIN_THRESHOLD_MM = "
+        f"{rain_thresholds['RAIN']:g} mm"
+    )
+
+    print(
+        "  Past10Min_THRESHOLD_MM = "
+        f"{rain_thresholds['Past10Min']:g} mm"
+    )
+
+    print(
+        "  Past1hr_THRESHOLD_MM = "
+        f"{rain_thresholds['Past1hr']:g} mm"
+    )
+
+    print(
+        "  Past24hr_THRESHOLD_MM = "
+        f"{rain_thresholds['Past24hr']:g} mm"
     )
 
     # --------------------------------------------------------
@@ -1348,6 +1799,16 @@ def main() -> int:
                 "Precipitation"
             ),
             "mm",
+            "| 10min:",
+            row.get(
+                "Past10Min"
+            ),
+            "mm",
+            "| 1hr:",
+            row.get(
+                "Past1hr"
+            ),
+            "mm",
             "| 24h:",
             row.get(
                 "Past24hr"
@@ -1383,6 +1844,9 @@ def main() -> int:
 
     # --------------------------------------------------------
     # Telegram 每日報告
+    #
+    # 注意：
+    # 只有至少一項雨量達到門檻的測站才會輸出。
     # --------------------------------------------------------
 
     report = build_report(
@@ -1393,13 +1857,18 @@ def main() -> int:
         ),
 
         date_str=today,
+
+        thresholds=rain_thresholds,
     )
 
     print("")
+
     print(
         "========== Telegram Report =========="
     )
+
     print(report)
+
     print(
         "======================================"
     )
@@ -1416,25 +1885,31 @@ def main() -> int:
 
     # --------------------------------------------------------
     # 雨量警報
+    #
+    # TARGET_STATIONS 全部測站都會檢查。
+    # 任一雨量項目達到對應門檻即觸發。
     # --------------------------------------------------------
 
     triggered = find_alerts(
         station_map=station_map,
-        threshold=rain_threshold,
+        thresholds=rain_thresholds,
     )
 
     if triggered:
 
         alert = build_alert(
             triggered=triggered,
-            threshold=rain_threshold,
+            thresholds=rain_thresholds,
         )
 
         print("")
+
         print(
             "========== Rain Alert =========="
         )
+
         print(alert)
+
         print(
             "================================"
         )
@@ -1452,12 +1927,11 @@ def main() -> int:
     else:
 
         print(
-            "✅ 沒有測站達到 "
-            f"{rain_threshold:g} mm "
-            "警戒門檻"
+            "✅ 沒有測站達到任何雨量警戒門檻"
         )
 
     print("")
+
     print(
         "✅ Workflow 執行完成"
     )
