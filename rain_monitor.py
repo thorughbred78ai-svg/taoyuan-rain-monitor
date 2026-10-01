@@ -16,9 +16,9 @@
     5. 依四組 Repository Secrets 判斷雨量警戒
     6. 四項全部未達門檻 → 不輸出該測站
     7. 任一項達到門檻 → 輸出該測站
-    8. Telegram 推送每日監測報告
-    9. 達任一雨量警戒門檻時發送警報
-    10. GitHub Actions 可直接執行
+    8. 任一測站達警戒 → Telegram 推送每日監測報告
+    9. 任一測站達警戒 → Telegram 發送雨量警報
+   10. GitHub Actions 可直接執行
 
 必要環境變數：
     CWA_API_KEY
@@ -41,6 +41,10 @@
 可選環境變數：
     DEBUG_CWA
 
+網路連線設定：
+    HTTP_RETRIES = 4
+    HTTP_TIMEOUT = 30 秒
+
 警戒判斷邏輯：
 
     Precipitation >= RAIN_THRESHOLD_MM
@@ -53,13 +57,19 @@
 
     任一項達到門檻：
         → 輸出測站
+        → 發送 Telegram 每日報告
+        → 發送 Telegram 雨量警報
 
     四項全部低於門檻：
-        → 不輸出測站
+        → 不輸出該測站
+        → 不發送 Telegram
 """
+
 
 import json
 import os
+import time
+
 from datetime import datetime
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -76,6 +86,12 @@ CWA_API_URL = (
     "https://opendata.cwa.gov.tw/api/v1/rest/datastore/"
     f"{CWA_DATASET_ID}"
 )
+
+# HTTP API 最大嘗試次數
+HTTP_RETRIES = 4
+
+# HTTP 單次連線 timeout
+HTTP_TIMEOUT = 30
 
 
 # ============================================================
@@ -183,29 +199,6 @@ def get_env(
 def get_rain_thresholds() -> dict[str, float]:
     """
     取得四項雨量警戒門檻。
-
-    GitHub Repository Secrets：
-
-        RAIN_THRESHOLD_MM
-            → Precipitation
-
-        Past10Min_THRESHOLD_MM
-            → Past10Min
-
-        Past1hr_THRESHOLD_MM
-            → Past1hr
-
-        Past24hr_THRESHOLD_MM
-            → Past24hr
-
-    回傳：
-
-        {
-            "RAIN": float,
-            "Past10Min": float,
-            "Past1hr": float,
-            "Past24hr": float,
-        }
     """
 
     env_names = {
@@ -325,18 +318,15 @@ def parse_precipitation(
     if value == "":
         return 0.0
 
-    # 雨跡
     if value.upper() == "T":
         return 0.0
 
-    # 特殊缺值
     if value in (
         "-",
         "--",
     ):
         return 0.0
 
-    # CWA 特殊缺值
     if value in (
         "-98",
         "-99",
@@ -349,7 +339,6 @@ def parse_precipitation(
             value
         )
 
-        # NaN
         if not number == number:
             return 0.0
 
@@ -364,63 +353,242 @@ def parse_precipitation(
 
 
 # ============================================================
+# HTTP Retry 工具
+# ============================================================
+
+def get_retry_wait_seconds(
+    attempt: int,
+) -> int:
+    """
+    Exponential Backoff。
+
+    attempt 1 → 2 秒
+    attempt 2 → 4 秒
+    attempt 3 → 8 秒
+    """
+
+    return min(
+        2 ** attempt,
+        10,
+    )
+
+
+def build_http_headers(
+    headers: dict | None = None,
+) -> dict:
+    """
+    建立共用 HTTP Header。
+
+    Connection: close：
+        避免 GitHub Actions Runner
+        重用可能已被遠端關閉的連線。
+    """
+
+    result = {
+        "Accept": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 "
+            "(compatible; "
+            "taoyuan-rain-monitor/1.0; "
+            "+https://github.com/)"
+        ),
+        "Connection": "close",
+    }
+
+    if headers:
+        result.update(
+            headers
+        )
+
+    return result
+
+
+# ============================================================
 # HTTP JSON
 # ============================================================
 
 def fetch_json(
     url: str,
     headers: dict | None = None,
-    timeout: int = 30,
+    timeout: int = HTTP_TIMEOUT,
+    retries: int = HTTP_RETRIES,
 ) -> dict:
     """
     GET JSON API。
+
+    自動處理：
+
+        - Connection reset
+        - Connection error
+        - timeout
+        - URLError
+        - HTTP 429
+        - HTTP 5xx
+
+    暫時性錯誤會自動 Retry。
+
+    JSON 格式錯誤則不 Retry，
+    直接回報真正問題。
     """
 
-    request = Request(
-        url,
-        headers=headers or {},
-        method="GET",
+    request_headers = build_http_headers(
+        headers
     )
 
-    try:
+    last_error = None
 
-        with urlopen(
-            request,
-            timeout=timeout,
-        ) as response:
+    for attempt in range(
+        1,
+        retries + 1,
+    ):
 
-            body = response.read().decode(
-                "utf-8"
-            )
-
-            return json.loads(
-                body
-            )
-
-    except HTTPError as exc:
-
-        body = exc.read().decode(
-            "utf-8",
-            errors="replace",
+        request = Request(
+            url,
+            headers=request_headers,
+            method="GET",
         )
 
+        try:
+
+            print(
+                f"🌐 API 連線嘗試 "
+                f"{attempt}/{retries}"
+            )
+
+            with urlopen(
+                request,
+                timeout=timeout,
+            ) as response:
+
+                body = response.read().decode(
+                    "utf-8"
+                )
+
+                return json.loads(
+                    body
+                )
+
+        except HTTPError as exc:
+
+            last_error = exc
+
+            body = exc.read().decode(
+                "utf-8",
+                errors="replace",
+            )
+
+            # ------------------------------------------------
+            # 429 Too Many Requests
+            # 5xx Server Error
+            # → 可以 Retry
+            # ------------------------------------------------
+
+            if (
+                exc.code == 429
+                or 500 <= exc.code < 600
+            ):
+
+                print(
+                    f"⚠️ API HTTP {exc.code}"
+                    f"（第 {attempt}/{retries} 次）"
+                )
+
+                if attempt < retries:
+
+                    wait_seconds = (
+                        get_retry_wait_seconds(
+                            attempt
+                        )
+                    )
+
+                    print(
+                        f"⏳ "
+                        f"{wait_seconds} 秒後重試..."
+                    )
+
+                    time.sleep(
+                        wait_seconds
+                    )
+
+                    continue
+
+            # ------------------------------------------------
+            # 其他 HTTP 錯誤
+            # → 通常不是暫時性連線問題
+            # ------------------------------------------------
+
+            raise RuntimeError(
+                f"HTTP {exc.code}: "
+                f"{body[:2000]}"
+            ) from exc
+
+        except (
+            URLError,
+            TimeoutError,
+            ConnectionResetError,
+            ConnectionError,
+        ) as exc:
+
+            last_error = exc
+
+            print(
+                "⚠️ API 連線暫時失敗："
+                f"{exc}"
+            )
+
+            if attempt < retries:
+
+                wait_seconds = (
+                    get_retry_wait_seconds(
+                        attempt
+                    )
+                )
+
+                print(
+                    f"⏳ "
+                    f"{wait_seconds} 秒後重試..."
+                )
+
+                time.sleep(
+                    wait_seconds
+                )
+
+                continue
+
+            break
+
+        except json.JSONDecodeError as exc:
+
+            raise RuntimeError(
+                "API 回傳內容不是有效 JSON"
+            ) from exc
+
+    # --------------------------------------------------------
+    # 所有 Retry 都失敗
+    # --------------------------------------------------------
+
+    if last_error is not None:
+
+        reason = getattr(
+            last_error,
+            "reason",
+            None,
+        )
+
+        if reason is None:
+            reason = str(
+                last_error
+            )
+
         raise RuntimeError(
-            f"HTTP {exc.code}: "
-            f"{body[:2000]}"
-        ) from exc
+            "API 連線失敗，"
+            f"已重試 {retries} 次："
+            f"{reason}"
+        ) from last_error
 
-    except URLError as exc:
-
-        raise RuntimeError(
-            "API 連線失敗："
-            f"{exc.reason}"
-        ) from exc
-
-    except json.JSONDecodeError as exc:
-
-        raise RuntimeError(
-            "API 回傳內容不是有效 JSON"
-        ) from exc
+    raise RuntimeError(
+        "API 連線失敗"
+    )
 
 
 # ============================================================
@@ -445,11 +613,6 @@ def fetch_cwa_data(
 
     headers = {
         "Authorization": api_key,
-        "Accept": "application/json",
-        "User-Agent": (
-            "taoyuan-rain-monitor/"
-            "github-actions"
-        ),
     }
 
     print("")
@@ -459,7 +622,8 @@ def fetch_cwa_data(
     payload = fetch_json(
         url=url,
         headers=headers,
-        timeout=30,
+        timeout=HTTP_TIMEOUT,
+        retries=HTTP_RETRIES,
     )
 
     return payload
@@ -916,7 +1080,6 @@ def normalize_data(
                     date_str
                 ),
 
-                # 今日 0 時至目前
                 "Precipitation": (
                     precipitation
                 ),
@@ -933,7 +1096,6 @@ def normalize_data(
                     precipitation > 0
                 ),
 
-                # 其他雨量
                 "Past10Min": (
                     past_10_min
                 ),
@@ -958,7 +1120,6 @@ def normalize_data(
                     past_24hr
                 ),
 
-                # 地理資訊
                 "CountyName": (
                     county_name
                 ),
@@ -1046,12 +1207,6 @@ def station_reaches_threshold(
 ) -> bool:
     """
     判斷測站是否至少有一項雨量達到警戒門檻。
-
-    任一項達到門檻：
-        True
-
-    四項全部低於門檻：
-        False
     """
 
     rain = float(
@@ -1195,13 +1350,8 @@ def build_report(
     """
     建立每日 Telegram 報告。
 
-    規則：
-
-        四項雨量全部未達門檻
-            → 不輸出該測站
-
-        任一項達到門檻
-            → 輸出該測站
+    只有達到至少一項雨量門檻的測站
+    才會出現在報告中。
     """
 
     now = get_taipei_now()
@@ -1249,11 +1399,6 @@ def build_report(
 
         if not data:
             continue
-
-        # ----------------------------------------------------
-        # 四項全部未達門檻
-        # → 完全不輸出該測站
-        # ----------------------------------------------------
 
         if not station_reaches_threshold(
             data,
@@ -1345,10 +1490,6 @@ def build_report(
             "────────────────"
         )
 
-    # --------------------------------------------------------
-    # 沒有任何測站達到門檻
-    # --------------------------------------------------------
-
     if found_count == 0:
 
         lines.extend(
@@ -1387,7 +1528,7 @@ def find_alerts(
     """
     找出至少一項雨量達到警戒門檻的測站。
 
-    這裡檢查 TARGET_STATIONS 的全部測站。
+    TARGET_STATIONS 全部檢查。
     """
 
     triggered = []
@@ -1423,8 +1564,6 @@ def build_alert(
 ) -> str:
     """
     建立雨量警報。
-
-    任一雨量項目達到各自門檻即可進入警報。
     """
 
     lines = [
@@ -1539,11 +1678,7 @@ def build_alert(
                 f"   • {item}"
             )
 
-        lines.extend(
-            [
-                "",
-            ]
-        )
+        lines.append("")
 
     lines.append(
         "🔎 資料來源："
@@ -1563,9 +1698,20 @@ def send_telegram(
     bot_token: str,
     chat_id: str,
     text: str,
+    timeout: int = HTTP_TIMEOUT,
+    retries: int = HTTP_RETRIES,
 ) -> None:
     """
     使用 Telegram Bot API 發送訊息。
+
+    自動 Retry：
+
+        - Connection reset
+        - Connection error
+        - timeout
+        - URLError
+        - HTTP 429
+        - HTTP 5xx
     """
 
     if not bot_token:
@@ -1594,64 +1740,175 @@ def send_telegram(
         "utf-8"
     )
 
-    request = Request(
-        url,
-        data=payload,
-        headers={
+    request_headers = build_http_headers(
+        {
             "Content-Type":
                 "application/x-www-form-urlencoded",
-
-            "User-Agent":
-                "taoyuan-rain-monitor/"
-                "github-actions",
-        },
-        method="POST",
+        }
     )
 
-    try:
+    last_error = None
 
-        with urlopen(
-            request,
-            timeout=30,
-        ) as response:
+    for attempt in range(
+        1,
+        retries + 1,
+    ):
 
-            body = response.read().decode(
-                "utf-8"
-            )
-
-            result = json.loads(
-                body
-            )
-
-            if not result.get(
-                "ok",
-                False,
-            ):
-
-                raise RuntimeError(
-                    "Telegram API 回傳失敗："
-                    f"{result}"
-                )
-
-    except HTTPError as exc:
-
-        body = exc.read().decode(
-            "utf-8",
-            errors="replace",
+        request = Request(
+            url,
+            data=payload,
+            headers=request_headers,
+            method="POST",
         )
 
-        raise RuntimeError(
-            "Telegram HTTP "
-            f"{exc.code}: "
-            f"{body[:2000]}"
-        ) from exc
+        try:
 
-    except URLError as exc:
+            print(
+                f"📨 Telegram 發送嘗試 "
+                f"{attempt}/{retries}"
+            )
+
+            with urlopen(
+                request,
+                timeout=timeout,
+            ) as response:
+
+                body = response.read().decode(
+                    "utf-8"
+                )
+
+                result = json.loads(
+                    body
+                )
+
+                if not result.get(
+                    "ok",
+                    False,
+                ):
+
+                    raise RuntimeError(
+                        "Telegram API 回傳失敗："
+                        f"{result}"
+                    )
+
+                return
+
+        except HTTPError as exc:
+
+            last_error = exc
+
+            body = exc.read().decode(
+                "utf-8",
+                errors="replace",
+            )
+
+            # ------------------------------------------------
+            # Telegram 429 / 5xx
+            # → Retry
+            # ------------------------------------------------
+
+            if (
+                exc.code == 429
+                or 500 <= exc.code < 600
+            ):
+
+                print(
+                    "⚠️ Telegram HTTP "
+                    f"{exc.code}"
+                )
+
+                if attempt < retries:
+
+                    wait_seconds = (
+                        get_retry_wait_seconds(
+                            attempt
+                        )
+                    )
+
+                    print(
+                        f"⏳ "
+                        f"{wait_seconds} 秒後重試..."
+                    )
+
+                    time.sleep(
+                        wait_seconds
+                    )
+
+                    continue
+
+            raise RuntimeError(
+                "Telegram HTTP "
+                f"{exc.code}: "
+                f"{body[:2000]}"
+            ) from exc
+
+        except (
+            URLError,
+            TimeoutError,
+            ConnectionResetError,
+            ConnectionError,
+        ) as exc:
+
+            last_error = exc
+
+            print(
+                "⚠️ Telegram 連線暫時失敗："
+                f"{exc}"
+            )
+
+            if attempt < retries:
+
+                wait_seconds = (
+                    get_retry_wait_seconds(
+                        attempt
+                    )
+                )
+
+                print(
+                    f"⏳ "
+                    f"{wait_seconds} 秒後重試..."
+                )
+
+                time.sleep(
+                    wait_seconds
+                )
+
+                continue
+
+            break
+
+        except json.JSONDecodeError as exc:
+
+            raise RuntimeError(
+                "Telegram API 回傳內容不是有效 JSON"
+            ) from exc
+
+    # --------------------------------------------------------
+    # 所有 Retry 都失敗
+    # --------------------------------------------------------
+
+    if last_error is not None:
+
+        reason = getattr(
+            last_error,
+            "reason",
+            None,
+        )
+
+        if reason is None:
+            reason = str(
+                last_error
+            )
 
         raise RuntimeError(
-            "Telegram 連線失敗："
-            f"{exc.reason}"
-        ) from exc
+            "Telegram 連線失敗，"
+            f"已重試 {retries} 次："
+            f"{reason}"
+        ) from last_error
+
+    raise RuntimeError(
+        "Telegram 發送失敗"
+    )
 
 
 # ============================================================
@@ -1868,57 +2125,85 @@ def main() -> int:
     )
 
     # --------------------------------------------------------
-    # Telegram 每日報告
+    # 找出達到雨量警戒的測站
     #
-    # 注意：
-    # 只有至少一項雨量達到門檻的測站才會輸出。
-    # --------------------------------------------------------
-
-    report = build_report(
-        station_map=station_map,
-
-        requested_stations=(
-            DEFAULT_REPORT_STATIONS
-        ),
-
-        date_str=today,
-
-        thresholds=rain_thresholds,
-    )
-
-    print("")
-
-    print(
-        "========== Telegram Report =========="
-    )
-
-    print(report)
-
-    print(
-        "======================================"
-    )
-
-    send_telegram(
-        bot_token=telegram_bot_token,
-        chat_id=telegram_chat_id,
-        text=report,
-    )
-
-    print(
-        "✅ Telegram 每日雨量報告已發送"
-    )
-
-    # --------------------------------------------------------
-    # 雨量警報
-    #
-    # TARGET_STATIONS 全部測站都會檢查。
-    # 任一雨量項目達到對應門檻即觸發。
+    # 這裡只執行一次。
+    # 後面的 Telegram 報告及警報共用結果。
     # --------------------------------------------------------
 
     triggered = find_alerts(
         station_map=station_map,
         thresholds=rain_thresholds,
     )
+
+    print("")
+
+    print(
+        "達到雨量警戒測站數量："
+        f"{len(triggered)}"
+    )
+
+    # --------------------------------------------------------
+    # Telegram 每日報告
+    #
+    # 重要：
+    #
+    # 如果沒有任何測站達到門檻，
+    # 完全不呼叫 Telegram API。
+    # --------------------------------------------------------
+
+    if triggered:
+
+        report = build_report(
+            station_map=station_map,
+
+            requested_stations=(
+                DEFAULT_REPORT_STATIONS
+            ),
+
+            date_str=today,
+
+            thresholds=rain_thresholds,
+        )
+
+        print("")
+
+        print(
+            "========== Telegram Report =========="
+        )
+
+        print(report)
+
+        print(
+            "======================================"
+        )
+
+        send_telegram(
+            bot_token=telegram_bot_token,
+            chat_id=telegram_chat_id,
+            text=report,
+        )
+
+        print(
+            "✅ Telegram 每日雨量報告已發送"
+        )
+
+    else:
+
+        print(
+            "ℹ️ 目前指定測站均未達任何雨量警戒門檻。"
+        )
+
+        print(
+            "ℹ️ 不發送 Telegram 每日報告。"
+        )
+
+    # --------------------------------------------------------
+    # 雨量警報
+    #
+    # triggered 已經在上面取得，
+    # 不重新查詢、不重新判斷。
+    # --------------------------------------------------------
 
     if triggered:
 
