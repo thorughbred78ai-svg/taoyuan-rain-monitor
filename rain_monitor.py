@@ -73,6 +73,7 @@ import time
 from datetime import datetime
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from http.client import IncompleteRead
 from urllib.error import HTTPError, URLError
 
 
@@ -523,6 +524,7 @@ def fetch_json(
             ) from exc
 
         except (
+            IncompleteRead,
             URLError,
             TimeoutError,
             ConnectionResetError,
@@ -533,28 +535,28 @@ def fetch_json(
 
             print(
                 "⚠️ API 連線暫時失敗："
-                f"{exc}"
+                f"{type(exc).__name__}: {exc}"
             )
-
+        
             if attempt < retries:
-
+        
                 wait_seconds = (
                     get_retry_wait_seconds(
                         attempt
                     )
                 )
-
+        
                 print(
                     f"⏳ "
                     f"{wait_seconds} 秒後重試..."
                 )
-
+        
                 time.sleep(
                     wait_seconds
                 )
-
+        
                 continue
-
+        
             break
 
         except json.JSONDecodeError as exc:
